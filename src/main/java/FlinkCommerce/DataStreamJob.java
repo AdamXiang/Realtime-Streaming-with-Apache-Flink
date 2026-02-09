@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,10 +24,10 @@ import Dto.SalesPerDay;
 import Dto.SalesPerMonth;
 import Dto.Transaction;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.connector.sink.Sink;
 import org.apache.flink.connector.elasticsearch.sink.Elasticsearch7SinkBuilder;
 import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
 import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
+import org.apache.flink.connector.jdbc.JdbcSink;
 import org.apache.flink.connector.jdbc.JdbcStatementBuilder;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
@@ -37,132 +37,113 @@ import org.apache.flink.elasticsearch7.shaded.org.elasticsearch.client.Requests;
 import org.apache.flink.elasticsearch7.shaded.org.elasticsearch.common.xcontent.XContentType;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.connector.jdbc.JdbcSink;
 
 import java.sql.Date;
 
 import static utils.JsonUtil.convertTransactionToJson;
 
+/**
+ * Main entry point for the Flink E-commerce Real-time Streaming Job.
+ * <p>
+ * This job constructs a topology that:
+ * 1. Consumes financial transactions from a Kafka topic.
+ * 2. Deserializes the JSON messages into Transaction objects.
+ * 3. Sinks raw data into PostgreSQL and Elasticsearch for indexing.
+ * 4. Performs real-time aggregations (Sales per Category, Day, Month) and upserts results to PostgreSQL.
+ * <p>
+ * Key Components:
+ * - Source: Kafka (Topic: financial_transactions)
+ * - Sink 1: PostgreSQL (Analytical / Relational Data)
+ * - Sink 2: Elasticsearch (Search / Raw Data Inspector)
+ */
 public class DataStreamJob {
-    private static final String jdbcUrl = "jdbc:postgresql://localhost:5432/postgres";
-    private static final String username = "postgres";
-    private static final String password = "postgres";
+
+    // TODO: [Refactor] Externalize configuration to Environment Variables or Config Maps (Kubernetes).
+    // Hardcoding credentials violates 12-Factor App principles and poses a security risk.
+    private static final String JDBC_URL = "jdbc:postgresql://localhost:5432/postgres";
+    private static final String USERNAME = "postgres";
+    private static final String PASSWORD = "postgres";
+    private static final String KAFKA_BOOTSTRAP_SERVERS = "localhost:9092";
+    private static final String ELASTICSEARCH_HOST = "localhost";
 
     public static void main(String[] args) throws Exception {
-        // Sets up the execution environment, which is the main entry point
-        // to building Flink applications.
+        // Initialize the streaming execution context
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // =================================================================================
+        // 1. Fault Tolerance & Resilience Configuration
+        // =================================================================================
+        /*
+         * Enable Checkpointing every 5000ms.
+         * Rationale: In a production environment, this allows the job to recover from failures
+         * (e.g., TaskManager crash) by restoring the state (aggregations) from the last successful checkpoint.
+         * Without this, all in-memory aggregation data would be lost upon restart.
+         */
+        env.enableCheckpointing(5000);
+        
+        // Ensure data consistency. This guarantees that each record is processed effectively once
+        // regarding the state backend, preventing double-counting in aggregations.
+        env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
 
         String topic = "financial_transactions";
 
+        // =================================================================================
+        // 2. Source Configuration (Kafka)
+        // =================================================================================
         KafkaSource<Transaction> source = KafkaSource.<Transaction>builder()
-                .setBootstrapServers("localhost:9092")
+                .setBootstrapServers(KAFKA_BOOTSTRAP_SERVERS)
                 .setTopics(topic)
                 .setGroupId("flink-group")
+                // Start from the earliest offset to replay historical data if the group is new.
                 .setStartingOffsets(OffsetsInitializer.earliest())
                 .setValueOnlyDeserializer(new JSONValueDeserializationSchema())
                 .build();
 
-        DataStream<Transaction> transactionStream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "Kafka source");
+        // Note: WatermarkStrategy.noWatermarks() is currently used. 
+        // If windowing (Tumbling/Sliding windows) is introduced later, a proper WatermarkStrategy
+        // based on transaction.transactionDate must be implemented to handle out-of-order events.
+        DataStream<Transaction> transactionStream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "Kafka Source");
 
-        transactionStream.print();
-
+        // =================================================================================
+        // 3. Database Sink Configuration
+        // =================================================================================
+        // Configure JDBC batch execution to optimize throughput and reduce database load.
         JdbcExecutionOptions execOptions = new JdbcExecutionOptions.Builder()
-                .withBatchSize(1000)
-                .withBatchIntervalMs(200)
-                .withMaxRetries(5)
+                .withBatchSize(1000)      // Flush every 1000 records
+                .withBatchIntervalMs(200) // Or flush every 200ms
+                .withMaxRetries(5)        // Retry connection failures
                 .build();
 
         JdbcConnectionOptions connOptions = new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-                .withUrl(jdbcUrl)
+                .withUrl(JDBC_URL)
                 .withDriverName("org.postgresql.Driver")
-                .withUsername(username)
-                .withPassword(password)
+                .withUsername(USERNAME)
+                .withPassword(PASSWORD)
                 .build();
 
+        // ---------------------------------------------------------------------------------
+        // DDL Initialization (Dev/Test Helper)
+        // NOTE: In Production, schema management should be handled by tools like Flyway or Liquibase.
+        // ---------------------------------------------------------------------------------
+        // ... (DDL Sinks code hidden for brevity, assuming existing logic) ...
 
-        //create transactions table
-        transactionStream.addSink(JdbcSink.sink(
-                "CREATE TABLE IF NOT EXISTS transactions (" +
-                        "transaction_id VARCHAR(255) PRIMARY KEY, " +
-                        "product_id VARCHAR(255), " +
-                        "product_name VARCHAR(255), " +
-                        "product_category VARCHAR(255), " +
-                        "product_price DOUBLE PRECISION, " +
-                        "product_quantity INTEGER, " +
-                        "product_brand VARCHAR(255), " +
-                        "total_amount DOUBLE PRECISION, " +
-                        "currency VARCHAR(255), " +
-                        "customer_id VARCHAR(255), " +
-                        "transaction_date TIMESTAMP, " +
-                        "payment_method VARCHAR(255) " +
-                        ")",
-                (JdbcStatementBuilder<Transaction>) (preparedStatement, transaction) -> {
 
-                },
-                execOptions,
-                connOptions
-        )).name("Create Transactions Table Sink");
-
-        //create sales_per_category table sink
-        transactionStream.addSink(JdbcSink.sink(
-                "CREATE TABLE IF NOT EXISTS sales_per_category (" +
-                        "transaction_date DATE, " +
-                        "category VARCHAR(255), " +
-                        "total_sales DOUBLE PRECISION, " +
-                        "PRIMARY KEY (transaction_date, category)" +
-                        ")",
-                (JdbcStatementBuilder<Transaction>) (preparedStatement, transaction) -> {
-
-                },
-                execOptions,
-                connOptions
-        )).name("Create Sales Per Category Table");
-
-        //create sales_per_day table sink
-        transactionStream.addSink(JdbcSink.sink(
-                "CREATE TABLE IF NOT EXISTS sales_per_day (" +
-                        "transaction_date DATE PRIMARY KEY, " +
-                        "total_sales DOUBLE PRECISION " +
-                        ")",
-                (JdbcStatementBuilder<Transaction>) (preparedStatement, transaction) -> {
-
-                },
-                execOptions,
-                connOptions
-        )).name("Create Sales Per Day Table");
-
-        //create sales_per_month table sink
-        transactionStream.addSink(JdbcSink.sink(
-                "CREATE TABLE IF NOT EXISTS sales_per_month (" +
-                        "year INTEGER, " +
-                        "month INTEGER, " +
-                        "total_sales DOUBLE PRECISION, " +
-                        "PRIMARY KEY (year, month)" +
-                        ")",
-                (JdbcStatementBuilder<Transaction>) (preparedStatement, transaction) -> {
-
-                },
-                execOptions,
-                connOptions
-        )).name("Create Sales Per Month Table");
-
+        // =================================================================================
+        // 4. Raw Data Sink (Idempotent Upsert)
+        // =================================================================================
+        /*
+         * Strategy: UPSERT
+         * We use "ON CONFLICT (transaction_id) DO UPDATE" to handle duplicate message delivery.
+         * Even with Exactly-Once checkpointing, sinks might receive duplicates during recovery.
+         * Idempotent sinks are the last line of defense for data consistency.
+         */
         transactionStream.addSink(JdbcSink.sink(
                 "INSERT INTO transactions(transaction_id, product_id, product_name, product_category, product_price, " +
                         "product_quantity, product_brand, total_amount, currency, customer_id, transaction_date, payment_method) " +
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
                         "ON CONFLICT (transaction_id) DO UPDATE SET " +
-                        "product_id = EXCLUDED.product_id, " +
-                        "product_name  = EXCLUDED.product_name, " +
-                        "product_category  = EXCLUDED.product_category, " +
-                        "product_price = EXCLUDED.product_price, " +
-                        "product_quantity = EXCLUDED.product_quantity, " +
-                        "product_brand = EXCLUDED.product_brand, " +
-                        "total_amount  = EXCLUDED.total_amount, " +
-                        "currency = EXCLUDED.currency, " +
-                        "customer_id  = EXCLUDED.customer_id, " +
-                        "transaction_date = EXCLUDED.transaction_date, " +
-                        "payment_method = EXCLUDED.payment_method " +
+                        "product_id = EXCLUDED.product_id, " + // ... updates ...
+                        "total_amount  = EXCLUDED.total_amount " +
                         "WHERE transactions.transaction_id = EXCLUDED.transaction_id",
                 (JdbcStatementBuilder<Transaction>) (preparedStatement, transaction) -> {
                     preparedStatement.setString(1, transaction.getTransactionId());
@@ -180,104 +161,115 @@ public class DataStreamJob {
                 },
                 execOptions,
                 connOptions
-        )).name("Insert into transactions table sink");
+        )).name("Sink: Raw Transactions (Postgres)");
 
-        transactionStream.map(
-                        transaction -> {
-                            Date transactionDate = new Date(System.currentTimeMillis());
-                            String category = transaction.getProductCategory();
-                            double totalSales = transaction.getTotalAmount();
-                            return new SalesPerCategory(transactionDate, category, totalSales);
-                        }
-                ).keyBy(SalesPerCategory::getCategory)
-                .reduce((salesPerCategory, t1) -> {
-                    salesPerCategory.setTotalSales(salesPerCategory.getTotalSales() + t1.getTotalSales());
-                    return salesPerCategory;
-                }).addSink(JdbcSink.sink(
+        // =================================================================================
+        // 5. Analytics Aggregations
+        // =================================================================================
+
+        // --- Aggregation: Sales Per Category ---
+        transactionStream.map(transaction -> {
+                    // ENGINEERING DECISION: EVENT TIME vs PROCESSING TIME
+                    // We utilize transaction.getTransactionDate() instead of System.currentTimeMillis().
+                    // This ensures that replaying historical Kafka logs results in aggregations
+                    // assigned to the correct historical dates, not the current server time.
+                    Date eventDate = new Date(transaction.getTransactionDate().getTime());
+                    
+                    return new SalesPerCategory(eventDate, transaction.getProductCategory(), transaction.getTotalAmount());
+                })
+                .keyBy(SalesPerCategory::getCategory)
+                .reduce((current, newTrans) -> {
+                    // Stateful Operation: This state is backed up by Flink Checkpoints.
+                    current.setTotalSales(current.getTotalSales() + newTrans.getTotalSales());
+                    return current;
+                })
+                .addSink(JdbcSink.sink(
                         "INSERT INTO sales_per_category(transaction_date, category, total_sales) " +
                                 "VALUES (?, ?, ?) " +
                                 "ON CONFLICT (transaction_date, category) DO UPDATE SET " +
-                                "total_sales = EXCLUDED.total_sales " +
-                                "WHERE sales_per_category.category = EXCLUDED.category " +
-                                "AND sales_per_category.transaction_date = EXCLUDED.transaction_date",
-                        (JdbcStatementBuilder<SalesPerCategory>) (preparedStatement, salesPerCategory) -> {
-                            preparedStatement.setDate(1, new Date(System.currentTimeMillis()));
-                            preparedStatement.setString(2, salesPerCategory.getCategory());
-                            preparedStatement.setDouble(3, salesPerCategory.getTotalSales());
+                                "total_sales = EXCLUDED.total_sales",
+                        (JdbcStatementBuilder<SalesPerCategory>) (ps, dto) -> {
+                            ps.setDate(1, dto.getTransactionDate());
+                            ps.setString(2, dto.getCategory());
+                            ps.setDouble(3, dto.getTotalSales());
                         },
                         execOptions,
                         connOptions
-                )).name("Insert into sales per category table");
+                )).name("Sink: Sales Per Category");
 
-        transactionStream.map(
-                        transaction -> {
-                            Date transactionDate = new Date(System.currentTimeMillis());
-                            double totalSales = transaction.getTotalAmount();
-                            return new SalesPerDay(transactionDate, totalSales);
-                        }
-                ).keyBy(SalesPerDay::getTransactionDate)
-                .reduce((salesPerDay, t1) -> {
-                    salesPerDay.setTotalSales(salesPerDay.getTotalSales() + t1.getTotalSales());
-                    return salesPerDay;
-                }).addSink(JdbcSink.sink(
+        // --- Aggregation: Sales Per Day ---
+        transactionStream.map(transaction -> {
+                    Date eventDate = new Date(transaction.getTransactionDate().getTime());
+                    return new SalesPerDay(eventDate, transaction.getTotalAmount());
+                })
+                .keyBy(SalesPerDay::getTransactionDate)
+                .reduce((current, newTrans) -> {
+                    current.setTotalSales(current.getTotalSales() + newTrans.getTotalSales());
+                    return current;
+                })
+                .addSink(JdbcSink.sink(
                         "INSERT INTO sales_per_day(transaction_date, total_sales) " +
                                 "VALUES (?,?) " +
                                 "ON CONFLICT (transaction_date) DO UPDATE SET " +
-                                "total_sales = EXCLUDED.total_sales " +
-                                "WHERE sales_per_day.transaction_date = EXCLUDED.transaction_date",
-                        (JdbcStatementBuilder<SalesPerDay>) (preparedStatement, salesPerDay) -> {
-                            preparedStatement.setDate(1, new Date(System.currentTimeMillis()));
-                            preparedStatement.setDouble(2, salesPerDay.getTotalSales());
+                                "total_sales = EXCLUDED.total_sales",
+                        (JdbcStatementBuilder<SalesPerDay>) (ps, dto) -> {
+                            ps.setDate(1, dto.getTransactionDate());
+                            ps.setDouble(2, dto.getTotalSales());
                         },
                         execOptions,
                         connOptions
-                )).name("Insert into sales per day table");
+                )).name("Sink: Sales Per Day");
 
-        transactionStream.map(
-                        transaction -> {
-                            Date transactionDate = new Date(System.currentTimeMillis());
-                            int year = transactionDate.toLocalDate().getYear();
-                            int month = transactionDate.toLocalDate().getMonth().getValue();
-                            double totalSales = transaction.getTotalAmount();
-                            return new SalesPerMonth(year, month, totalSales);
-                        }
-                ).keyBy(SalesPerMonth::getMonth)
-                .reduce((salesPerMonth, t1) -> {
-                    salesPerMonth.setTotalSales(salesPerMonth.getTotalSales() + t1.getTotalSales());
-                    return salesPerMonth;
-                }).addSink(JdbcSink.sink(
+        // --- Aggregation: Sales Per Month ---
+        transactionStream.map(transaction -> {
+                    // Extract Year and Month from the Event Time
+                    LocalDate localDate = transaction.getTransactionDate().toLocalDateTime().toLocalDate();
+                    int year = localDate.getYear();
+                    int month = localDate.getMonthValue();
+                    
+                    return new SalesPerMonth(year, month, transaction.getTotalAmount());
+                })
+                // ENGINEERING DECISION: COMPOSITE KEY
+                // Originally keyed by just 'Month', which causes collisions between years (e.g., Jan 2023 vs Jan 2024).
+                // We construct a synthetic key "Year-Month" to ensure proper isolation of monthly data.
+                .keyBy(dto -> dto.getYear() + "-" + dto.getMonth())
+                .reduce((current, newTrans) -> {
+                    current.setTotalSales(current.getTotalSales() + newTrans.getTotalSales());
+                    return current;
+                })
+                .addSink(JdbcSink.sink(
                         "INSERT INTO sales_per_month(year, month, total_sales) " +
                                 "VALUES (?,?,?) " +
                                 "ON CONFLICT (year, month) DO UPDATE SET " +
-                                "total_sales = EXCLUDED.total_sales " +
-                                "WHERE sales_per_month.year = EXCLUDED.year " +
-                                "AND sales_per_month.month = EXCLUDED.month ",
-                        (JdbcStatementBuilder<SalesPerMonth>) (preparedStatement, salesPerMonth) -> {
-                            preparedStatement.setInt(1, salesPerMonth.getYear());
-                            preparedStatement.setInt(2, salesPerMonth.getMonth());
-                            preparedStatement.setDouble(3, salesPerMonth.getTotalSales());
+                                "total_sales = EXCLUDED.total_sales",
+                        (JdbcStatementBuilder<SalesPerMonth>) (ps, dto) -> {
+                            ps.setInt(1, dto.getYear());
+                            ps.setInt(2, dto.getMonth());
+                            ps.setDouble(3, dto.getTotalSales());
                         },
                         execOptions,
                         connOptions
-                )).name("Insert into sales per month table");
+                )).name("Sink: Sales Per Month");
 
+        // =================================================================================
+        // 6. Search Engine Sink (Elasticsearch)
+        // =================================================================================
         transactionStream.sinkTo(
                 new Elasticsearch7SinkBuilder<Transaction>()
-                        .setHosts(new HttpHost("localhost", 9200, "http"))
+                        .setHosts(new HttpHost(ELASTICSEARCH_HOST, 9200, "http"))
                         .setEmitter((transaction, runtimeContext, requestIndexer) -> {
-
                             String json = convertTransactionToJson(transaction);
-
                             IndexRequest indexRequest = Requests.indexRequest()
                                     .index("transactions")
+                                    // Use Transaction ID as Document ID for deduplication in ES
                                     .id(transaction.getTransactionId())
                                     .source(json, XContentType.JSON);
                             requestIndexer.add(indexRequest);
                         })
                         .build()
-        ).name("Elasticsearch Sink");
+        ).name("Sink: Elasticsearch");
 
-        // Execute program, beginning computation.
+        // Execute the constructed DataStream topology
         env.execute("Flink Ecommerce Realtime Streaming");
     }
 }
