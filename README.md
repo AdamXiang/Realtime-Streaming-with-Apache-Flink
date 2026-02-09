@@ -41,11 +41,11 @@ A production-ready real-time e-commerce transaction processor demonstrating **ev
    └────────┬─────────┘
             │ (JSON Records)
             ▼
-   ┌──────────────────────────────┐
-   │   Apache Kafka Broker        │
+   ┌───────────────────────────────┐
+   │   Apache Kafka Broker         │
    │  Topic: financial_transactions│
-   │  Partition: 1 (Dev), N (Prod)│
-   └────────┬─────────────────────┘
+   │  Partition: 1 (Dev), N (Prod) │
+   └────────┬──────────────────────┘
             │
             ▼
    ┌──────────────────────────────────────────────────────────────┐
@@ -925,3 +925,4 @@ MIT License - See LICENSE file for details
 **Flink Version:** 1.18.0  
 **Java Version:** 11+  
 **Status:** Production-Ready for Learning & Development
+
